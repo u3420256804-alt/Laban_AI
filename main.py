@@ -1,66 +1,41 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-LMA Effort Actions – end‑to‑end pipeline (Python, PyTorch, MediaPipe)
---------------------------------------------------------------------
+LMA Effort Actions – end‑to‑end pipeline (v2, stronger generalization)
+---------------------------------------------------------------------
 Co robi ten plik:
 1) Ekstrakcja szkieletów z wideo (MediaPipe Pose) i zapis do .npz
-2) Budowa zbioru (train/val/test) z augmentacją sekwencji
-3) Trenowanie klasyfikatora (BiLSTM lub TCN) na sekwencjach szkieletów
-4) Ewaluacja (accuracy, F1, confusion matrix)
-5) Inference na nowym wideo (predykcja klasy i prawdopodobieństw)
+2) Budowa zbioru (train/val/test) z MOCNĄ augmentacją sekwencji
+3) Modele do wyboru: BiLSTM, TCN, TransformerEncoder
+4) Trening z class weights / (opcjonalnie) balanced sampler, LR scheduler, early‑stopping
+5) Ewaluacja (accuracy, F1, confusion matrix)
+6) Predykcja okienkami + majority vote / softmax mean; możliwość zapisu timeline (CSV)
 
-Struktura katalogów oczekiwana na wejściu (surowe wideo):
-DATA_ROOT/
-  punch/
-    vid_001.mp4
-    vid_002.mp4
-    ...
-  wring/
-    vid_010.mp4
-  press/
-  flick/
-  ... (dowolne klasy LMA, np. 8 effort actions)
-
-Wywołania (przykłady):
-1) Ekstrakcja
-   python LMA_DeepLearning_Pipeline.py extract \
-      --data_root ./data_raw \
-      --out_dir ./data_proc \
-      --min_conf 0.5 --fps 25
-
-2) Split train/val/test
-   python LMA_DeepLearning_Pipeline.py split \
-      --proc_dir ./data_proc \
-      --splits_dir ./splits \
-      --train 0.7 --val 0.15 --test 0.15 --seed 42
-
-3) Trening
-   python LMA_DeepLearning_Pipeline.py train \
-      --proc_dir ./data_proc --splits_dir ./splits \
-      --model lstm --epochs 50 --batch 8 --lr 3e-4 \
-      --save_dir ./runs/exp1 --augment 1
-
-4) Ewaluacja na teście
-   python LMA_DeepLearning_Pipeline.py eval \
-      --proc_dir ./data_proc --splits_dir ./splits \
-      --ckpt ./runs/exp1/best.pt
-
-5) Predykcja na nowym wideo
-   python LMA_DeepLearning_Pipeline.py predict \
-      --video path/to/new.mp4 \
-      --ckpt ./runs/exp1/best.pt \
-      --class_map ./data_proc/class_map.json
+Kluczowe usprawnienia vs v1:
+- normalizacja póz (center=mid‑hip, skala=rozstaw barków; opcjonalne wyrównanie yaw barków w 2D)
+- augmentacje: time‑warp, jitter pozycji, dropout stawów, left‑right flip (z mapą par stawów), random crop w czasie
+- nowe modele: TransformerEncoder, ulepszony TCN; wybór --model {lstm,tcn,transformer}
+- class weights (automatycznie z train split), opcjonalny --balance_sampler
+- predykcja segmentowa: --segment_len, --predict_stride, --vote {mean,majority}, zapis CSV z timeline
 
 Wymagania (pip):
-- mediapipe
-- opencv-python
-- torch, torchvision, torchaudio (zgodnie z CUDA lub CPU)
-- numpy, scipy, scikit-learn, matplotlib
+- mediapipe,
+- opencv-python,
+- torch, torchvision, torchaudio (zgodnie z CUDA/CPU),
+- numpy, scipy, scikit-learn,
 - tqdm
 
-Uwaga: MediaPipe Pose zwraca 33 punkty na klatkę (x,y,z,visibility). Tutaj
-budujemy cechę  (x,y,z,vis, dx,dy,dz) znormalizowaną względem wymiaru ciała.
+Przykłady użycia:
+- Ekstrakcja:  python main_v2.py extract --data_root ./data_raw --out_dir ./data_proc --min_conf 0.5 --fps 25
+- Split:       python main_v2.py split --proc_dir ./data_proc --splits_dir ./splits --train 0.7 --val 0.15 --test 0.15 --seed 42
+- Trening:     python main_v2.py train --proc_dir ./data_proc --splits_dir ./splits \
+                              --model transformer --epochs 70 --batch 8 --lr 3e-4 \
+                              --save_dir ./runs/exp2 --augment 1 --max_len 300 \
+                              --early_stop 10 --balance_sampler 0
+- Ewaluacja:   python main_v2.py eval --proc_dir ./data_proc --splits_dir ./splits --ckpt ./runs/exp2/best.pt
+- Predykcja:   python main_v2.py predict --video path/to/new.mp4 --ckpt ./runs/exp2/best.pt \
+                              --class_map ./data_proc/class_map.json \
+                              --segment_len 120 --predict_stride 60 --vote mean --save_timeline timeline.csv
 """
 
 import os
@@ -70,23 +45,33 @@ import math
 import glob
 import time
 import random
-import shutil
 import argparse
 import itertools
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # Torch
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
-# ML utils
+# Metrics
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
 
 # Progress
 from tqdm import tqdm
+
+# -------------------------
+# 0) Konfiguracje i stałe
+# -------------------------
+POSE_LANDMARKS = 33  # MediaPipe Pose
+LEFT_RIGHT_PAIRS = [
+    (11, 12), (13, 14), (15, 16),
+    (23, 24), (25, 26), (27, 28), (29, 30), (31, 32)
+]
+LEFT_INDEXES = {11,13,15,23,25,27,29,31}
+RIGHT_INDEXES = {12,14,16,24,26,28,30,32}
 
 # -------------------------
 # 1) Pose extraction (MediaPipe)
@@ -97,40 +82,43 @@ except ImportError:
     mp = None
     print("[WARN] mediapipe nie jest zainstalowane – komenda 'extract' nie zadziała.")
 
-POSE_LANDMARKS = 33  # MediaPipe
 
-
-def pair_distance(a, b):
-    return math.sqrt(sum((ai - bi) ** 2 for ai, bi in zip(a, b)))
-
-
-def normalize_landmarks(landmarks: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Normalizacja szkieletu: przesunięcie do środka miednicy i skalowanie rozmiarem ciała.
-    landmarks: (33, 4) -> (x,y,z,vis)
+def normalize_landmarks(landmarks: np.ndarray, align_shoulders: bool = True) -> Tuple[np.ndarray, float]:
+    """Normalizacja szkieletu: przesunięcie do środka miednicy i skalowanie
+    rozstawem barków; opcjonalne wyrównanie yaw (obrót w 2D tak, by barki były poziome).
+    landmarks: (33,4) -> (x,y,z,vis)
     Zwraca: norm_landmarks (33,4), scale (float)
     """
-    # Użyjemy midpoint bioder (LEFT_HIP=23, RIGHT_HIP=24) jako centrum
     LHIP, RHIP = 23, 24
+    LSH, RSH = 11, 12
+
     center = (landmarks[LHIP, :3] + landmarks[RHIP, :3]) / 2.0
     shifted = landmarks.copy()
     shifted[:, :3] = landmarks[:, :3] - center
 
-    # Skala: dystans barków (LEFT_SHOULDER=11, RIGHT_SHOULDER=12) lub bioder jako fallback
-    LSH, RSH = 11, 12
     if landmarks[LSH, 3] > 0 and landmarks[RSH, 3] > 0:
         scale = np.linalg.norm(landmarks[LSH, :3] - landmarks[RSH, :3]) + 1e-6
     else:
         scale = np.linalg.norm(landmarks[LHIP, :3] - landmarks[RHIP, :3]) + 1e-6
-
     shifted[:, :3] /= scale
+
+    if align_shoulders and shifted[LSH, 3] > 0 and shifted[RSH, 3] > 0:
+        # Obrót w 2D (x,y), tak aby linia barków była pozioma
+        dx = shifted[RSH, 0] - shifted[LSH, 0]
+        dy = shifted[RSH, 1] - shifted[LSH, 1]
+        angle = math.atan2(dy, dx)
+        ca, sa = math.cos(-angle), math.sin(-angle)
+        xy = shifted[:, :2].copy()
+        x_new = ca * xy[:, 0] - sa * xy[:, 1]
+        y_new = sa * xy[:, 0] + ca * xy[:, 1]
+        shifted[:, 0] = x_new
+        shifted[:, 1] = y_new
     return shifted, float(scale)
 
 
 def extract_sequence_from_video(video_path: str, min_conf: float = 0.5, fps: int = 25,
-                                static_image_mode: bool = False) -> Dict:
-    """Przetwarza wideo -> sekwencja landmarków i cech pochodnych.
-    Zwraca dict z kluczami: 'landmarks' (T,33,4), 'features' (T,33,7), 'orig_fps', 'used_fps'
-    """
+                                static_image_mode: bool = False,
+                                align_shoulders: bool = True) -> Dict:
     if mp is None:
         raise RuntimeError("mediapipe nie jest zainstalowane")
 
@@ -170,7 +158,7 @@ def extract_sequence_from_video(video_path: str, min_conf: float = 0.5, fps: int
             arr[i, 1] = lm[i].y
             arr[i, 2] = lm[i].z
             arr[i, 3] = lm[i].visibility
-        arr, _ = normalize_landmarks(arr)
+        arr, _ = normalize_landmarks(arr, align_shoulders=align_shoulders)
         landmarks_all.append(arr)
 
     cap.release()
@@ -195,10 +183,8 @@ def extract_sequence_from_video(video_path: str, min_conf: float = 0.5, fps: int
 
 def extract_dir(data_root: str, out_dir: str, min_conf: float = 0.5, fps: int = 25):
     os.makedirs(out_dir, exist_ok=True)
-    class_map = {}
     classes = sorted([d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))])
-    for ci, c in enumerate(classes):
-        class_map[c] = ci
+    class_map = {c: i for i, c in enumerate(classes)}
     with open(os.path.join(out_dir, 'class_map.json'), 'w', encoding='utf-8') as f:
         json.dump(class_map, f, ensure_ascii=False, indent=2)
 
@@ -206,9 +192,7 @@ def extract_dir(data_root: str, out_dir: str, min_conf: float = 0.5, fps: int = 
         in_dir = os.path.join(data_root, c)
         out_c = os.path.join(out_dir, c)
         os.makedirs(out_c, exist_ok=True)
-        videos = sorted(glob.glob(os.path.join(in_dir, '*.mp4')) +
-                        glob.glob(os.path.join(in_dir, '*.mov')) +
-                        glob.glob(os.path.join(in_dir, '*.avi')))
+        videos = sorted(sum([glob.glob(os.path.join(in_dir, ext)) for ext in ('*.mp4','*.mov','*.avi')], []))
         print(f"[CLS {c}] {len(videos)} plików")
         for v in tqdm(videos, desc=f"Extract {c}"):
             base = os.path.splitext(os.path.basename(v))[0]
@@ -221,7 +205,6 @@ def extract_dir(data_root: str, out_dir: str, min_conf: float = 0.5, fps: int = 
             except Exception as e:
                 print("[WARN] pomijam", v, "=>", e)
 
-
 # -------------------------
 # 2) Splity train/val/test
 # -------------------------
@@ -231,13 +214,7 @@ def make_splits(proc_dir: str, splits_dir: str, train: float, val: float, test: 
     random.seed(seed)
     os.makedirs(splits_dir, exist_ok=True)
 
-    items = []
     class_map = json.load(open(os.path.join(proc_dir, 'class_map.json'), 'r', encoding='utf-8'))
-    for c in class_map:
-        files = sorted(glob.glob(os.path.join(proc_dir, c, '*.npz')))
-        items += [(f, c) for f in files]
-
-    # per-class split dla balansu
     splits = {'train': [], 'val': [], 'test': []}
     for c in class_map:
         files = sorted(glob.glob(os.path.join(proc_dir, c, '*.npz')))
@@ -256,24 +233,23 @@ def make_splits(proc_dir: str, splits_dir: str, train: float, val: float, test: 
                 f.write(p + '\n')
     print("Zapisano splity do:", splits_dir)
 
-
 # -------------------------
-# 3) Dataset + augmentacja sekwencji
+# 3) Augmentacje sekwencji i dataset
 # -------------------------
 @dataclass
 class AugmentCfg:
-    time_warp_prob: float = 0.2
-    time_warp_strength: float = 0.2  # resample +/-20%
-    jitter_prob: float = 0.3
-    jitter_sigma: float = 0.01
-    dropout_prob: float = 0.2
-    dropout_rate: float = 0.1  # procent punktów do wyzerowania (symuluje brak detekcji)
+    time_warp_prob: float = 0.5
+    time_warp_strength: float = 0.3  # resample +/-30%
+    jitter_prob: float = 0.6
+    jitter_sigma: float = 0.015      # standard dev dla x,y,z po normalizacji
+    dropout_prob: float = 0.5
+    dropout_rate: float = 0.1        # procent punktów do wyzerowania
+    flip_prob: float = 0.5           # losowe lustrzane odbicie L<->R
+    random_crop_prob: float = 0.5
+    crop_ratio_min: float = 0.6      # min proporcja długości po cropie
 
 
 def time_resample(seq: np.ndarray, scale: float) -> np.ndarray:
-    """Resampling w osi czasu przez interpolację liniową.
-    seq: (T,33,7) -> (int(T*scale),33,7)
-    """
     T = seq.shape[0]
     new_T = max(int(round(T * scale)), 2)
     xs = np.linspace(0, 1, T)
@@ -285,16 +261,35 @@ def time_resample(seq: np.ndarray, scale: float) -> np.ndarray:
     return out
 
 
+def flip_lr(seq: np.ndarray) -> np.ndarray:
+    """Lustrzane odbicie w osi X oraz zamiana indeksów L<->R."""
+    s = seq.copy()
+    s[:, :, 0] *= -1.0  # x -> -x
+    for l, r in LEFT_RIGHT_PAIRS:
+        s[:, [l, r], :] = s[:, [r, l], :]
+    return s
+
+
+def random_time_crop(seq: np.ndarray, ratio_min: float) -> np.ndarray:
+    T = seq.shape[0]
+    keep = max(int(T * max(ratio_min, 0.05)), 2)
+    if keep >= T:
+        return seq
+    st = random.randint(0, T - keep)
+    return seq[st:st+keep]
+
+
 def augment_sequence(seq: np.ndarray, cfg: AugmentCfg) -> np.ndarray:
     s = seq.copy()
-    # Time-warp
+    if random.random() < cfg.random_crop_prob:
+        s = random_time_crop(s, cfg.crop_ratio_min)
     if random.random() < cfg.time_warp_prob:
         scale = 1.0 + random.uniform(-cfg.time_warp_strength, cfg.time_warp_strength)
         s = time_resample(s, scale)
-    # Jitter
+    if random.random() < cfg.flip_prob:
+        s = flip_lr(s)
     if random.random() < cfg.jitter_prob:
         s[:, :, :3] += np.random.normal(0, cfg.jitter_sigma, size=s[:, :, :3].shape)
-    # Dropout landmarków
     if random.random() < cfg.dropout_prob:
         mask = np.random.rand(*s[:, :, :3].shape) < cfg.dropout_rate
         s[:, :, :3][mask] = 0.0
@@ -307,7 +302,6 @@ class SkeletonSeqDataset(Dataset):
         super().__init__()
         self.files = files
         self.class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))
-        self.inv_map = {v: k for k, v in self.class_map.items()}
         self.max_len = max_len
         self.augment = augment
         self.augment_cfg = augment_cfg
@@ -315,16 +309,15 @@ class SkeletonSeqDataset(Dataset):
     def __len__(self):
         return len(self.files)
 
-    def pad_or_crop(self, x: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def pad_or_crop(x: np.ndarray, max_len: int) -> np.ndarray:
         T = x.shape[0]
-        if T == self.max_len:
+        if T == max_len:
             return x
-        if T > self.max_len:
-            # central crop
-            st = (T - self.max_len) // 2
-            return x[st:st + self.max_len]
-        # pad
-        pad = np.zeros((self.max_len - T, x.shape[1], x.shape[2]), dtype=x.dtype)
+        if T > max_len:
+            st = (T - max_len) // 2
+            return x[st:st + max_len]
+        pad = np.zeros((max_len - T, x.shape[1], x.shape[2]), dtype=x.dtype)
         return np.concatenate([x, pad], axis=0)
 
     def __getitem__(self, idx):
@@ -333,19 +326,15 @@ class SkeletonSeqDataset(Dataset):
         seq = data['features']  # (T,33,7)
         if self.augment:
             seq = augment_sequence(seq, self.augment_cfg)
-        seq = self.pad_or_crop(seq)
-        # z ścieżki klasy
+        seq = self.pad_or_crop(seq, self.max_len)
         cls_name = os.path.basename(os.path.dirname(path))
         y = self.class_map[cls_name]
-        # maska (1 tam gdzie są rzeczywiste klatki)
         mask = (seq.sum(axis=(1, 2)) != 0).astype(np.float32)
-        # flatten per-frame: (T, 33*7)
         seq = seq.reshape(seq.shape[0], -1)
         return torch.from_numpy(seq).float(), torch.tensor(y).long(), torch.from_numpy(mask).float()
 
-
 # -------------------------
-# 4) Modele: BiLSTM i TCN
+# 4) Modele: BiLSTM, TCN, Transformer
 # -------------------------
 class BiLSTMClassifier(nn.Module):
     def __init__(self, input_size: int, hidden: int, num_layers: int, num_classes: int, dropout: float = 0.3):
@@ -358,8 +347,7 @@ class BiLSTMClassifier(nn.Module):
     def forward(self, x, mask=None):  # x: (B,T,F)
         out, _ = self.lstm(x)
         if mask is not None:
-            # masked mean over time
-            mask = mask.unsqueeze(-1)  # (B,T,1)
+            mask = mask.unsqueeze(-1)
             out = (out * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-6)
         else:
             out = out.mean(dim=1)
@@ -411,6 +399,33 @@ class TCNClassifier(nn.Module):
         return self.fc(y)
 
 
+class TransformerClassifier(nn.Module):
+    def __init__(self, input_size: int, num_classes: int, d_model: int = 256, nhead: int = 8,
+                 num_layers: int = 4, dim_feedforward: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.proj = nn.Linear(input_size, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                                   dim_feedforward=dim_feedforward, dropout=dropout,
+                                                   batch_first=True, activation='gelu')
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.cls = nn.Linear(d_model, num_classes)
+
+    def forward(self, x, mask=None):  # x: (B,T,F)
+        h = self.proj(x)
+        if mask is not None:
+            # mask: 1 dla prawdziwych klatek -> trzeba zamienić na bool: True=pozycje do zmaskowania
+            # Transformer oczekuje src_key_padding_mask: True where to mask (ignore)
+            key_mask = (mask == 0.0)
+            h = self.encoder(h, src_key_padding_mask=key_mask)
+        else:
+            h = self.encoder(h)
+        if mask is not None:
+            mask_exp = mask.unsqueeze(-1)
+            pooled = (h * mask_exp).sum(dim=1) / (mask_exp.sum(dim=1) + 1e-6)
+        else:
+            pooled = h.mean(dim=1)
+        return self.cls(pooled)
+
 # -------------------------
 # 5) Trening / Ewaluacja
 # -------------------------
@@ -422,14 +437,17 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
-def make_loaders(proc_dir: str, splits_dir: str, batch: int, max_len: int, augment: bool) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
+def read_split_list(path: str) -> List[str]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return [l.strip() for l in f if l.strip()]
+
+
+def make_loaders(proc_dir: str, splits_dir: str, batch: int, max_len: int, augment: bool,
+                 balance_sampler: bool = False):
     class_map_path = os.path.join(proc_dir, 'class_map.json')
-    with open(os.path.join(splits_dir, 'train.txt'), 'r', encoding='utf-8') as f:
-        train_files = [l.strip() for l in f if l.strip()]
-    with open(os.path.join(splits_dir, 'val.txt'), 'r', encoding='utf-8') as f:
-        val_files = [l.strip() for l in f if l.strip()]
-    with open(os.path.join(splits_dir, 'test.txt'), 'r', encoding='utf-8') as f:
-        test_files = [l.strip() for l in f if l.strip()]
+    train_files = read_split_list(os.path.join(splits_dir, 'train.txt'))
+    val_files = read_split_list(os.path.join(splits_dir, 'val.txt'))
+    test_files = read_split_list(os.path.join(splits_dir, 'test.txt'))
 
     ds_train = SkeletonSeqDataset(train_files, class_map_path, max_len=max_len, augment=augment)
     ds_val = SkeletonSeqDataset(val_files, class_map_path, max_len=max_len, augment=False)
@@ -437,12 +455,78 @@ def make_loaders(proc_dir: str, splits_dir: str, batch: int, max_len: int, augme
 
     in_size = 33 * 7
 
-    return (
-        DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=2, drop_last=False),
-        DataLoader(ds_val, batch_size=batch, shuffle=False, num_workers=2, drop_last=False),
-        DataLoader(ds_test, batch_size=batch, shuffle=False, num_workers=2, drop_last=False),
-        in_size
-    )
+    # Sampler wagowy (opcjonalnie) – w razie lekkiej nierównowagi klas
+    if balance_sampler:
+        # policz częstości klas w train
+        class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))
+        counts = {k: 0 for k in class_map}
+        for p in train_files:
+            cls_name = os.path.basename(os.path.dirname(p))
+            counts[cls_name] += 1
+        total = sum(counts.values())
+        weights_per_class = {cls: total / (len(counts) * c) for cls, c in counts.items()}
+        weights = []
+        for p in train_files:
+            cls_name = os.path.basename(os.path.dirname(p))
+            weights.append(weights_per_class[cls_name])
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        train_loader = DataLoader(ds_train, batch_size=batch, sampler=sampler, num_workers=2, drop_last=False)
+    else:
+        train_loader = DataLoader(ds_train, batch_size=batch, shuffle=True, num_workers=2, drop_last=False)
+
+    val_loader = DataLoader(ds_val, batch_size=batch, shuffle=False, num_workers=2, drop_last=False)
+    test_loader = DataLoader(ds_test, batch_size=batch, shuffle=False, num_workers=2, drop_last=False)
+    return train_loader, val_loader, test_loader, in_size
+
+
+def build_model(model_name: str, in_size: int, num_classes: int, args) -> nn.Module:
+    if model_name == 'lstm':
+        return BiLSTMClassifier(input_size=in_size, hidden=args.hidden, num_layers=args.layers,
+                                num_classes=num_classes, dropout=args.dropout)
+    elif model_name == 'tcn':
+        return TCNClassifier(input_size=in_size, num_classes=num_classes, channels=[args.hidden]*3,
+                             kernel=3, dropout=args.dropout)
+    elif model_name == 'transformer':
+        return TransformerClassifier(input_size=in_size, num_classes=num_classes, d_model=args.hidden,
+                                     nhead=max(2, args.hidden // 64), num_layers=args.layers,
+                                     dim_feedforward=args.hidden*2, dropout=args.dropout)
+    else:
+        raise ValueError("model must be one of: lstm, tcn, transformer")
+
+
+def compute_class_weights(train_files: List[str], class_map_path: str) -> torch.Tensor:
+    class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))
+    counts = np.zeros(len(class_map), dtype=np.int64)
+    for p in train_files:
+        cls_name = os.path.basename(os.path.dirname(p))
+        counts[class_map[cls_name]] += 1
+    # wagi ~ 1/freq (znormalizowane do średniej = 1)
+    inv = 1.0 / np.clip(counts, 1, None)
+    w = inv * (len(counts) / inv.sum())
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def evaluate(model, loader, device, class_map_path: Optional[str] = None, ret_cm: bool = False):
+    model.eval()
+    ys, ps = [], []
+    with torch.no_grad():
+        for x, y, m in loader:
+            x, y, m = x.to(device), y.to(device), m.to(device)
+            logits = model(x, mask=m)
+            pred = logits.argmax(dim=1)
+            ys += y.cpu().tolist()
+            ps += pred.cpu().tolist()
+    acc = accuracy_score(ys, ps)
+    f1 = f1_score(ys, ps, average='macro')
+    if not ret_cm:
+        return acc, f1
+    cm = confusion_matrix(ys, ps)
+    target_names = None
+    if class_map_path is not None:
+        class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))
+        target_names = [k for k, _ in sorted(class_map.items(), key=lambda x: x[1])]
+    report = classification_report(ys, ps, target_names=target_names)
+    return acc, f1, cm, report
 
 
 def train_model(args):
@@ -456,27 +540,26 @@ def train_model(args):
         batch=args.batch,
         max_len=args.max_len,
         augment=bool(args.augment),
+        balance_sampler=bool(args.balance_sampler),
     )
 
-    class_map = json.load(open(os.path.join(args.proc_dir, 'class_map.json'), 'r', encoding='utf-8'))
+    class_map_path = os.path.join(args.proc_dir, 'class_map.json')
+    class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))
     num_classes = len(class_map)
 
-    if args.model == 'lstm':
-        model = BiLSTMClassifier(input_size=in_size, hidden=args.hidden, num_layers=args.layers,
-                                 num_classes=num_classes, dropout=args.dropout)
-    elif args.model == 'tcn':
-        model = TCNClassifier(input_size=in_size, num_classes=num_classes, channels=[args.hidden]*3,
-                              kernel=3, dropout=args.dropout)
-    else:
-        raise ValueError("model must be 'lstm' or 'tcn'")
+    model = build_model(args.model, in_size, num_classes, args).to(device)
 
-    model.to(device)
+    # Class weights z train split
+    train_files = read_split_list(os.path.join(args.splits_dir, 'train.txt'))
+    class_weights = compute_class_weights(train_files, class_map_path).to(device)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     best_f1 = -1.0
     best_path = os.path.join(args.save_dir, 'best.pt')
+    epochs_no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -493,8 +576,8 @@ def train_model(args):
             losses.append(loss.item())
             pbar.set_postfix({'loss': f"{np.mean(losses):.4f}"})
 
-        # Val
-        val_acc, val_f1 = evaluate(model, val_loader, device)
+        # Walidacja
+        val_acc, val_f1 = evaluate(model, val_loader, device, class_map_path=None)
         scheduler.step(val_f1)
         print(f"[VAL] acc={val_acc:.4f} f1={val_f1:.4f}")
 
@@ -502,102 +585,134 @@ def train_model(args):
             best_f1 = val_f1
             torch.save({'model': model.state_dict(), 'args': vars(args), 'class_map': class_map}, best_path)
             print("[SAVE] best ->", best_path)
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if args.early_stop > 0 and epochs_no_improve >= args.early_stop:
+                print(f"[EARLY STOP] brak poprawy przez {args.early_stop} epok.")
+                break
 
     # Test końcowy
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt['model'])
-    test_acc, test_f1, cm, report = evaluate(model, test_loader, device, ret_cm=True)
+    acc, f1, cm, report = evaluate(model, test_loader, device, class_map_path=class_map_path, ret_cm=True)
     with open(os.path.join(args.save_dir, 'test_report.txt'), 'w', encoding='utf-8') as f:
         f.write(report + '\n')
         f.write("Confusion Matrix:\n")
         f.write(np.array2string(cm))
-    print("[TEST] acc=%.4f f1=%.4f" % (test_acc, test_f1))
-
-
-def evaluate(model, loader, device, ret_cm: bool = False):
-    model.eval()
-    ys, ps = [], []
-    with torch.no_grad():
-        for x, y, m in loader:
-            x, y, m = x.to(device), y.to(device), m.to(device)
-            logits = model(x, mask=m)
-            pred = logits.argmax(dim=1)
-            ys += y.cpu().tolist()
-            ps += pred.cpu().tolist()
-    acc = accuracy_score(ys, ps)
-    f1 = f1_score(ys, ps, average='macro')
-    if not ret_cm:
-        return acc, f1
-    cm = confusion_matrix(ys, ps)
-    # Dodano argument class_map_path, aby nie używać args
-    target_names = None
-    if hasattr(evaluate, 'class_map_path') and evaluate.class_map_path is not None:
-        class_map = json.load(open(evaluate.class_map_path, 'r', encoding='utf-8'))
-        target_names = [k for k, _ in sorted(class_map.items(), key=lambda x: x[1])]
-    report = classification_report(ys, ps, target_names=target_names)
-    return acc, f1, cm, report
-
+    print("[TEST] acc=%.4f f1=%.4f" % (acc, f1))
 
 # -------------------------
-# 6) Predykcja na jednym wideo
+# 6) Predykcja segmentowa na nowym wideo
 # -------------------------
 
-def predict_on_video(video_path: str, ckpt_path: str, class_map_path: str, model_type: str = None,
-                     max_len: int = 300) -> Dict:
+def predict_on_video_segments(video_path: str, ckpt_path: str, class_map_path: str,
+                              model_type: Optional[str] = None, max_len: int = 300,
+                              segment_len: int = 120, predict_stride: int = 60,
+                              vote: str = 'mean', save_timeline: Optional[str] = None) -> Dict:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     seq = extract_sequence_from_video(video_path)
-    x = seq['features']  # (T,33,7)
-    T = x.shape[0]
-    if T > max_len:
-        st = (T - max_len) // 2
-        x = x[st:st + max_len]
-    else:
-        pad = np.zeros((max_len - T, x.shape[1], x.shape[2]), dtype=x.dtype)
-        x = np.concatenate([x, pad], axis=0)
-    mask = (x.sum(axis=(1, 2)) != 0).astype(np.float32)
-    x = torch.from_numpy(x.reshape(max_len, -1)).unsqueeze(0).float().to(device)
-    mask = torch.from_numpy(mask).unsqueeze(0).float().to(device)
+    X = seq['features']  # (T,33,7)
+
+    # przygotuj okna [t, t+segment_len)
+    T = X.shape[0]
+    if T < 2:
+        raise ValueError("Za krótkie wideo do predykcji")
 
     ckpt = torch.load(ckpt_path, map_location=device)
     class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))
+    inv_map = {v: k for k, v in class_map.items()}
     num_classes = len(class_map)
 
-    # inferuj typ modelu jeśli nie podano
     if model_type is None:
         model_type = ckpt.get('args', {}).get('model', 'lstm')
 
     in_size = 33 * 7
+    # odtwórz model
     if model_type == 'lstm':
         model = BiLSTMClassifier(input_size=in_size, hidden=ckpt.get('args', {}).get('hidden', 256),
                                  num_layers=ckpt.get('args', {}).get('layers', 2),
                                  num_classes=num_classes, dropout=ckpt.get('args', {}).get('dropout', 0.3))
-    else:
+    elif model_type == 'tcn':
         model = TCNClassifier(input_size=in_size, num_classes=num_classes,
                               channels=[ckpt.get('args', {}).get('hidden', 256)]*3,
                               kernel=3, dropout=ckpt.get('args', {}).get('dropout', 0.2))
+    else:
+        model = TransformerClassifier(input_size=in_size, num_classes=num_classes,
+                                      d_model=ckpt.get('args', {}).get('hidden', 256),
+                                      nhead=max(2, ckpt.get('args', {}).get('hidden', 256)//64),
+                                      num_layers=ckpt.get('args', {}).get('layers', 4),
+                                      dim_feedforward=ckpt.get('args', {}).get('hidden', 256)*2,
+                                      dropout=ckpt.get('args', {}).get('dropout', 0.1))
     model.load_state_dict(ckpt['model'])
     model.to(device)
     model.eval()
 
-    with torch.no_grad():
-        logits = model(x, mask=mask)
-        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-        pred = int(probs.argmax())
+    # iteruj po segmentach
+    probs_list = []
+    seg_ranges = []
+    t = 0
+    while t < T:
+        seg = X[t:t+segment_len]
+        if seg.shape[0] == 0:
+            break
+        # pad/crop do max_len (użyjemy max_len aby dopasować do treningu)
+        if seg.shape[0] > max_len:
+            st = (seg.shape[0] - max_len) // 2
+            seg = seg[st:st+max_len]
+        else:
+            pad = np.zeros((max_len - seg.shape[0], seg.shape[1], seg.shape[2]), dtype=seg.dtype)
+            seg = np.concatenate([seg, pad], axis=0)
+        mask = (seg.sum(axis=(1, 2)) != 0).astype(np.float32)
+        x_t = torch.from_numpy(seg.reshape(max_len, -1)).unsqueeze(0).float().to(device)
+        m_t = torch.from_numpy(mask).unsqueeze(0).float().to(device)
+        with torch.no_grad():
+            logits = model(x_t, mask=m_t)
+            p = torch.softmax(logits, dim=1).cpu().numpy()[0]
+        probs_list.append(p)
+        seg_ranges.append((int(t), int(min(t+segment_len, T))))
+        t += predict_stride if predict_stride > 0 else segment_len
+        if predict_stride <= 0 and t >= T:
+            break
 
-    inv_map = {v: k for k, v in class_map.items()}
+    probs_arr = np.stack(probs_list, axis=0)  # (S,C)
+
+    if vote == 'majority':
+        votes = probs_arr.argmax(axis=1)
+        # tie‑break: weź klasę o najwyższej średniej pewności
+        vals, counts = np.unique(votes, return_counts=True)
+        pred_idx = int(vals[np.argmax(counts)])
+    else:  # mean softmax (domyślne, stabilniejsze)
+        mean_probs = probs_arr.mean(axis=0)
+        pred_idx = int(mean_probs.argmax())
+
+    if save_timeline:
+        import csv
+        with open(save_timeline, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            header = ['seg_idx', 'start_frame', 'end_frame'] + [inv_map[i] for i in range(num_classes)]
+            w.writerow(header)
+            for i, (p, (s, e)) in enumerate(zip(probs_list, seg_ranges)):
+                w.writerow([i, s, e] + list(map(lambda x: f"{x:.6f}", p)))
+        print(f"[TIMELINE] zapisano: {save_timeline}")
+
     return {
-        'pred_idx': pred,
-        'pred_class': inv_map[pred],
-        'probs': {inv_map[i]: float(p) for i, p in enumerate(probs)}
+        'pred_idx': pred_idx,
+        'pred_class': inv_map[pred_idx],
+        'probs': {inv_map[i]: float(p) for i, p in enumerate(probs_arr.mean(axis=0))},
+        'segments': {
+            'ranges': seg_ranges,
+            'per_segment_probs': [list(map(float, p)) for p in probs_list],
+            'classes': [inv_map[i] for i in range(num_classes)]
+        }
     }
-
 
 # -------------------------
 # 7) CLI
 # -------------------------
 
 def build_argparser():
-    p = argparse.ArgumentParser(description='LMA Effort Actions – end-to-end pipeline')
+    p = argparse.ArgumentParser(description='LMA Effort Actions – end-to-end pipeline (v2)')
     sub = p.add_subparsers(dest='cmd')
 
     p_ext = sub.add_parser('extract', help='Ekstrakcja szkieletów z wideo -> .npz')
@@ -617,16 +732,18 @@ def build_argparser():
     p_train = sub.add_parser('train', help='Trening klasyfikatora')
     p_train.add_argument('--proc_dir', type=str, required=True)
     p_train.add_argument('--splits_dir', type=str, required=True)
-    p_train.add_argument('--model', type=str, choices=['lstm', 'tcn'], default='lstm')
-    p_train.add_argument('--epochs', type=int, default=50)
+    p_train.add_argument('--model', type=str, choices=['lstm', 'tcn', 'transformer'], default='transformer')
+    p_train.add_argument('--epochs', type=int, default=70)
     p_train.add_argument('--batch', type=int, default=8)
     p_train.add_argument('--lr', type=float, default=3e-4)
     p_train.add_argument('--hidden', type=int, default=256)
-    p_train.add_argument('--layers', type=int, default=2)
-    p_train.add_argument('--dropout', type=float, default=0.3)
+    p_train.add_argument('--layers', type=int, default=4)
+    p_train.add_argument('--dropout', type=float, default=0.1)
     p_train.add_argument('--max_len', type=int, default=300)
     p_train.add_argument('--save_dir', type=str, required=True)
     p_train.add_argument('--augment', type=int, default=1)
+    p_train.add_argument('--balance_sampler', type=int, default=0)
+    p_train.add_argument('--early_stop', type=int, default=10)
     p_train.add_argument('--seed', type=int, default=42)
 
     p_eval = sub.add_parser('eval', help='Ewaluacja na teście')
@@ -634,11 +751,15 @@ def build_argparser():
     p_eval.add_argument('--splits_dir', type=str, required=True)
     p_eval.add_argument('--ckpt', type=str, required=True)
 
-    p_pred = sub.add_parser('predict', help='Predykcja na nowym wideo')
+    p_pred = sub.add_parser('predict', help='Predykcja na nowym wideo (okna + głosowanie)')
     p_pred.add_argument('--video', type=str, required=True)
     p_pred.add_argument('--ckpt', type=str, required=True)
     p_pred.add_argument('--class_map', type=str, required=True)
     p_pred.add_argument('--max_len', type=int, default=300)
+    p_pred.add_argument('--segment_len', type=int, default=120)
+    p_pred.add_argument('--predict_stride', type=int, default=60)
+    p_pred.add_argument('--vote', type=str, choices=['mean', 'majority'], default='mean')
+    p_pred.add_argument('--save_timeline', type=str, default=None)
 
     return p
 
@@ -658,32 +779,47 @@ def main():
 
     elif args.cmd == 'eval':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # quick evaluation using saved best
-        train_loader, val_loader, test_loader, _ = make_loaders(
+        class_map_path = os.path.join(args.proc_dir, 'class_map.json')
+        train_loader, val_loader, test_loader, in_size = make_loaders(
             proc_dir=args.proc_dir, splits_dir=args.splits_dir, batch=16, max_len=300, augment=False)
         ckpt = torch.load(args.ckpt, map_location=device)
-        class_map = ckpt.get('class_map', json.load(open(os.path.join(args.proc_dir, 'class_map.json'))))
+        class_map = ckpt.get('class_map', json.load(open(class_map_path)))
         num_classes = len(class_map)
-        model_type = ckpt.get('args', {}).get('model', 'lstm')
-        in_size = 33 * 7
+        model_type = ckpt.get('args', {}).get('model', 'transformer')
+        # zbuduj model spójny z checkpointem
+        dummy = argparse.Namespace(hidden=ckpt.get('args', {}).get('hidden', 256),
+                                   layers=ckpt.get('args', {}).get('layers', 4),
+                                   dropout=ckpt.get('args', {}).get('dropout', 0.1))
         if model_type == 'lstm':
-            model = BiLSTMClassifier(input_size=in_size, hidden=ckpt.get('args', {}).get('hidden', 256),
-                                     num_layers=ckpt.get('args', {}).get('layers', 2), num_classes=num_classes,
-                                     dropout=ckpt.get('args', {}).get('dropout', 0.3))
-        else:
+            model = BiLSTMClassifier(input_size=in_size, hidden=dummy.hidden, num_layers=dummy.layers,
+                                     num_classes=num_classes, dropout=dummy.dropout)
+        elif model_type == 'tcn':
             model = TCNClassifier(input_size=in_size, num_classes=num_classes,
-                                  channels=[ckpt.get('args', {}).get('hidden', 256)]*3,
-                                  kernel=3, dropout=ckpt.get('args', {}).get('dropout', 0.2))
+                                  channels=[dummy.hidden]*3, kernel=3, dropout=dummy.dropout)
+        else:
+            model = TransformerClassifier(input_size=in_size, num_classes=num_classes,
+                                          d_model=dummy.hidden,
+                                          nhead=max(2, dummy.hidden//64),
+                                          num_layers=dummy.layers,
+                                          dim_feedforward=dummy.hidden*2,
+                                          dropout=dummy.dropout)
         model.load_state_dict(ckpt['model'])
         model.to(device)
-        # przekazujemy ścieżkę do class_map.json przez atrybut funkcji
-        evaluate.class_map_path = os.path.join(args.proc_dir, 'class_map.json')
-        acc, f1, cm, report = evaluate(model, test_loader, device, ret_cm=True)
+        acc, f1, cm, report = evaluate(model, test_loader, device, class_map_path=class_map_path, ret_cm=True)
         print(report)
         print("Confusion matrix:\n", cm)
 
     elif args.cmd == 'predict':
-        out = predict_on_video(args.video, args.ckpt, args.class_map, max_len=args.max_len)
+        out = predict_on_video_segments(
+            video_path=args.video,
+            ckpt_path=args.ckpt,
+            class_map_path=args.class_map,
+            max_len=args.max_len,
+            segment_len=args.segment_len,
+            predict_stride=args.predict_stride,
+            vote=args.vote,
+            save_timeline=args.save_timeline
+        )
         print(json.dumps(out, ensure_ascii=False, indent=2))
 
     else:
