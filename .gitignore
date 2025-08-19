@@ -1,3 +1,4 @@
 # Ignore Python virtual environment
 .venv/
 data_raw/
+__pycache__/
