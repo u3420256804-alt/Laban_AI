@@ -133,6 +133,7 @@ def train_model(args):
     best_f1 = -1.0
     best_path = os.path.join(args.save_dir, 'best.pt')
     epochs_no_improve = 0
+    best_epoch = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -156,13 +157,17 @@ def train_model(args):
 
         if val_f1 > best_f1:
             best_f1 = val_f1
+            best_epoch = epoch  
             torch.save({'model': model.state_dict(), 'args': vars(args), 'class_map': class_map}, best_path)
             epochs_no_improve = 0
+            print(f"New best model at epoch {epoch} with val f1={val_f1:.4f}") 
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= args.early_stop:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    print(f"Best model at epoch {best_epoch} with val f1={best_f1:.4f}") 
 
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt['model'])

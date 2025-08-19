@@ -120,7 +120,12 @@ def main():
             save_timeline=args.save_timeline
         )
         print("Predicted class:", result['pred_class'])
-        print("Probabilities:", result['probs'])
+        print("Probabilities (mean over all segments):", result['probs'])
+        print("Segments:")
+        for (start, end), seg_probs in zip(result['segments']['ranges'], result['segments']['per_segment_probs']):
+            print(f"  Frames {start}-{end}:")
+            for cls, prob in zip(result['segments']['classes'], seg_probs):
+                print(f"    {cls}: {prob:.4f}")
     else:
         parser.print_help()
 
