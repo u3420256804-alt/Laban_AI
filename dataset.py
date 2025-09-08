@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 from augment import augment_sequence, AugmentCfg
 
 class SkeletonSeqDataset(Dataset):
-    def __init__(self, files, class_map_path, max_len=210, augment=False, augment_cfg=AugmentCfg()):
+    def __init__(self, files, class_map_path, max_len=200, augment=False, augment_cfg=AugmentCfg()):
         super().__init__()
         self.files = files
         self.class_map = json.load(open(class_map_path, 'r', encoding='utf-8'))

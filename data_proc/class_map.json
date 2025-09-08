@@ -1,0 +1,10 @@
+{
+  "dab": 0,
+  "flick": 1,
+  "float": 2,
+  "glide": 3,
+  "press": 4,
+  "punch": 5,
+  "slash": 6,
+  "wring": 7
+}

@@ -16,7 +16,7 @@ Split data into train/val/test:
 python main.py split --proc_dir ./data_proc --splits_dir ./splits --train 0.7 --val 0.15 --test 0.15
 
 Train the classifier:
-python main.py train --proc_dir ./data_proc --splits_dir ./splits --model transformer --epochs 70 --batch 8 --lr 3e-4 --hidden 256 --layers 4 --dropout 0.1 --max_len 300 --augment 1 --balance_sampler 0 --early_stop 10 --save_dir ./runs/exp2
+python main.py train --proc_dir ./data_proc --splits_dir ./splits --model transformer --epochs 70 --batch 8 --lr 3e-4 --hidden 256 --layers 4 --dropout 0.1 --max_len 200 --augment 1 --balance_sampler 0 --early_stop 15 --save_dir ./runs/exp2
 
 Evaluate on test set:
 python main.py eval --proc_dir ./data_proc --splits_dir ./splits --ckpt ./runs/exp2/best.pt
