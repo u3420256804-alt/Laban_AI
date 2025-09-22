@@ -57,8 +57,13 @@ def build_model(model_name: str, in_size: int, num_classes: int, args):
         return BiLSTMClassifier(input_size=in_size, hidden=args.hidden, num_layers=args.layers,
                                 num_classes=num_classes, dropout=args.dropout)
     elif model_name == 'tcn':
-        return TCNClassifier(input_size=in_size, num_classes=num_classes, channels=[args.hidden]*3,
-                             kernel=3, dropout=args.dropout)
+        return TCNClassifier(
+            input_size=in_size,
+            num_classes=num_classes,
+            channels=[args.hidden] * args.layers,
+            kernel=3,
+            dropout=args.dropout
+        )
     elif model_name == 'transformer':
         return TransformerClassifier(input_size=in_size, num_classes=num_classes, d_model=args.hidden,
                                      nhead=max(2, args.hidden // 64), num_layers=args.layers,
@@ -126,7 +131,7 @@ def train_model(args):
     train_files = read_split_list(os.path.join(args.splits_dir, 'train.txt'))
     class_weights = compute_class_weights(train_files, class_map_path).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.RAdam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 

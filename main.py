@@ -91,9 +91,19 @@ def main():
                                     num_layers=ckpt.get('args', {}).get('layers', 2),
                                     num_classes=num_classes, dropout=ckpt.get('args', {}).get('dropout', 0.3))
         elif model_type == 'tcn':
-            model = TCNClassifier(input_size=in_size, num_classes=num_classes,
-                                 channels=[ckpt.get('args', {}).get('hidden', 256)]*3,
-                                 kernel=3, dropout=ckpt.get('args', {}).get('dropout', 0.2))
+            layers = ckpt.get('args', {}).get('layers', 3)
+            hidden = ckpt.get('args', {}).get('hidden', 256)
+            dropout = ckpt.get('args', {}).get('dropout', 0.2)
+
+            print(f"Reconstructing TCN: hidden={hidden}, layers={layers}, dropout={dropout}")
+
+            model = TCNClassifier(
+                input_size=in_size,
+                num_classes=num_classes,
+                channels=[hidden] * layers,
+                kernel=3,
+                dropout=dropout
+            )
         else:
             model = TransformerClassifier(input_size=in_size, num_classes=num_classes,
                                          d_model=ckpt.get('args', {}).get('hidden', 256),
